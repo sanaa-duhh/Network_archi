@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+"""bcurl: fetch files over BH/1.
+
+    bcurl [-v] [-I] HOST[:PORT]/PATH [HOST[:PORT]/PATH ...]
+
+The response body goes to stdout.  -v hexdumps every frame on stderr, with
+the decoded headers under it.  -I sends HEAD and prints the response headers
+on stdout instead of a body.  Several URLs are fetched over the one
+connection, on streams 1, 3, 5, ...; they must share a host and port.
+
+Exit status: 0 on success; 22 when the server answered 4xx or 5xx (the code
+curl -f uses for the same thing); 1 when the connection or the protocol
+failed; 2 for a usage error.
+"""
+
+import argparse
+import re
+import socket
+import sys
+
+from bh1 import (DATA, END_STREAM, HEADERS, PREFACE, TYPE_NAMES, ConnectionClosed, Frame,
+                 MalformedError, ProtocolError, content_length, decode_headers, encode_headers,
+                 hexdump, read_frame, validate_response)
+
+USER_AGENT = b"bcurl/1.0"
+DEFAULT_PORT = 9000
+CONNECT_TIMEOUT = 10.0
+READ_TIMEOUT = 30.0
+
+EXIT_OK, EXIT_FAILED, EXIT_USAGE, EXIT_HTTP_ERROR = 0, 1, 2, 22
+
+_URL = re.compile(r"^(?:bh://)?(\[[^\]]+\]|[^/:\[\]]+)(?::(\d{1,5}))?(/.*)?$")
+
+
+class Verbose:
+    """Everything -v prints.  Silent unless enabled."""
+
+    def __init__(self, enabled):
+        self.enabled = enabled
+
+    def note(self, msg):
+        if self.enabled:
+            sys.stderr.write("* %s\n" % msg)
+
+    def raw(self, direction, label, data):
+        if self.enabled:
+            sys.stderr.write("%s %s\n%s\n" % (direction, label, hexdump(data, direction + " ")))
+
+    def frame(self, direction, frame):
+        self.raw(direction, frame.describe(), frame.to_bytes())
+
+    def fields(self, direction, fields):
+        if self.enabled:
+            for name, value in fields:
+                sys.stderr.write("%s %s: %s\n" % (direction, name.decode(), value.decode("utf-8", "replace")))
+
+
+def parse_url(text):
+    m = _URL.match(text)
+    if not m:
+        raise ValueError("cannot parse %r: expected HOST[:PORT]/PATH" % text)
+    host, port, path = m.groups()
+    return host.strip("[]"), int(port) if port else DEFAULT_PORT, path or "/"
+
+
+def fetch(sock, stream, method, authority, path, head_only, v):
+    """Send one request on `stream` and read its response.  Returns the status."""
+    request = [
+        (b":method", method),
+        (b":path", path.encode()),
+        (b"host", authority.encode()),
+        (b"user-agent", USER_AGENT),
+        (b"accept", b"*/*"),
+    ]
+    frame = Frame(HEADERS, END_STREAM, stream, encode_headers(request))
+    sock.sendall(frame.to_bytes())
+    v.frame(">", frame)
+    v.fields(">", request)
+
+    status = None
+    expected = None
+    received = 0
+    while True:
+        frame = read_frame(sock)
+        if frame is None:
+            raise ProtocolError("server closed the connection before the response ended")
+        v.frame("<", frame)
+        if frame.type not in TYPE_NAMES:
+            continue                                   # unknown type: skipped
+        if frame.stream != stream:
+            if frame.type == DATA and 0 < frame.stream < stream:
+                continue                               # tail of a stream already finished
+            raise ProtocolError("%s on stream %d while waiting on stream %d"
+                                % (TYPE_NAMES[frame.type], frame.stream, stream))
+        if frame.type == HEADERS:
+            if status is not None:
+                raise ProtocolError("second HEADERS frame on stream %d" % stream)
+            fields = decode_headers(frame.payload)
+            status, headers = validate_response(fields)
+            expected = content_length(headers)
+            v.fields("<", fields)
+            if head_only:
+                for name, value in fields:
+                    sys.stdout.write("%s: %s\n" % (name.decode(), value.decode("utf-8", "replace")))
+                sys.stdout.flush()
+            if frame.flags & END_STREAM:
+                return status
+        else:
+            if status is None:
+                raise ProtocolError("DATA before HEADERS on stream %d" % stream)
+            sys.stdout.buffer.write(frame.payload)
+            received += len(frame.payload)
+            if frame.flags & END_STREAM:
+                break
+    sys.stdout.buffer.flush()
+    if expected is not None and expected != received:
+        raise ProtocolError("content-length said %d bytes, body had %d" % (expected, received))
+    return status
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(prog="bcurl", description="fetch files over BH/1")
+    ap.add_argument("-v", "--verbose", action="store_true", help="hexdump every frame on stderr")
+    ap.add_argument("-I", "--head", action="store_true", help="send HEAD, print the response headers")
+    ap.add_argument("url", nargs="+", metavar="HOST[:PORT]/PATH")
+    args = ap.parse_args(argv[1:])
+    v = Verbose(args.verbose)
+
+    try:
+        targets = [parse_url(u) for u in args.url]
+    except ValueError as e:
+        ap.error(str(e))
+    host, port = targets[0][:2]
+    if any(t[:2] != (host, port) for t in targets):
+        ap.error("all URLs must share one host and port: this client opens one connection")
+    authority = "%s:%d" % (host, port)
+    method = b"HEAD" if args.head else b"GET"
+
+    worst = EXIT_OK
+    try:
+        sock = socket.create_connection((host, port), timeout=CONNECT_TIMEOUT)
+    except OSError as e:
+        sys.stderr.write("bcurl: cannot connect to %s: %s\n" % (authority, e))
+        return EXIT_FAILED
+    with sock:
+        sock.settimeout(READ_TIMEOUT)
+        v.note("connected to %s:%d" % sock.getpeername()[:2])
+        sock.sendall(PREFACE)
+        v.raw(">", "preface (%d bytes)" % len(PREFACE), PREFACE)
+        try:
+            for i, (_, _, path) in enumerate(targets):
+                status = fetch(sock, 2 * i + 1, method, authority, path, args.head, v)
+                if status >= 400:
+                    v.note("server answered %d for %s" % (status, path))
+                    worst = EXIT_HTTP_ERROR
+        except (ProtocolError, MalformedError, ConnectionClosed, OSError) as e:
+            sys.stderr.write("bcurl: %s\n" % e)
+            return EXIT_FAILED
+        v.note("closing connection")
+    return worst
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
